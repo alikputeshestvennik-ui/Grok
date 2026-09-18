@@ -1,1 +1,213 @@
+name: Build Blackbox Phone+Watch (V12 Gemini Nano)
 
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'BlackboxOffline_REALTIME_FINAL_V12_GEMINI_NANO.zip'
+      - '.github/workflows/build-from-zip-v12-gemini.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configure Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager -print -quit)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo 'ERROR: sdkmanager was not found.'
+            find "$ANDROID_HOME" -type f -name sdkmanager -print || true
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0' \
+            'ndk;25.2.9519653' \
+            'cmake;3.22.1'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_NAME='BlackboxOffline_REALTIME_FINAL_V12_GEMINI_NANO.zip'
+          if [ ! -f "$ZIP_NAME" ]; then
+            echo "ERROR: $ZIP_NAME is missing from repository root."
+            find . -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+
+          rm -rf _project
+          mkdir -p _project
+          unzip -q -o "$ZIP_NAME" -d _project
+
+          PROJECT_ROOT="$(find _project -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -print -quit | xargs -r dirname)"
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo 'ERROR: Android project root was not found in ZIP.'
+            find _project -maxdepth 4 -type f | sort | head -300
+            exit 1
+          fi
+
+          cp -a "$PROJECT_ROOT"/. ./
+          rm -rf _project
+
+          find app wear llm -type f -exec touch {} + 2>/dev/null || true
+          rm -rf app/.cxx wear/.cxx llm/.cxx .gradle
+
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          printf 'ndk.dir=%s/ndk/25.2.9519653\n' "$ANDROID_HOME" >> local.properties
+
+          ls -la
+          cat settings.gradle
+
+      - name: Verify project structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle
+          test -f app/build.gradle
+          test -f wear/build.gradle
+          test -f llm/build.gradle
+          test -f app/src/main/cpp/CMakeLists.txt
+          test -f app/src/main/cpp/blackbox_ai.cpp
+          test -f app/src/main/java/com/blackbox/offline/LocalAiEngine.java
+          test -f app/src/main/java/com/blackbox/offline/GeminiNanoEngine.java
+          test -f app/src/main/java/com/blackbox/offline/RealtimeTranscriber.java
+          grep -q 'GGML_NATIVE OFF' app/src/main/cpp/CMakeLists.txt
+          echo 'Project structure OK (GeminiNanoEngine present, GGML_NATIVE=OFF)'
+
+      - name: Fetch pinned llama.cpp b3403
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LLAMA_DIR='app/src/main/cpp/third_party/llama.cpp'
+          if [ ! -f "$LLAMA_DIR/CMakeLists.txt" ]; then
+            rm -rf "$LLAMA_DIR"
+            git clone --depth 1 --branch b3403 \
+              https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
+          fi
+
+          test -f "$LLAMA_DIR/CMakeLists.txt"
+          test -f "$LLAMA_DIR/include/llama.h"
+          echo 'llama.cpp b3403 is present.'
+
+      - name: Compile Java first
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle :app:compileReleaseJavaWithJavac \
+                 :wear:compileReleaseJavaWithJavac \
+                 --no-daemon --stacktrace
+
+      - name: Build Phone and Galaxy Watch release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle :app:assembleRelease :wear:assembleRelease \
+            --no-daemon --stacktrace
+
+      - name: Create keystore and sign APKs (1 secret: BLACKBOX)
+        shell: bash
+        env:
+          BLACKBOX: ${{ secrets.BLACKBOX }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BLACKBOX:-}" ]; then
+            echo "ERROR: Secret BLACKBOX (keystore password) is not set."
+            echo "Add repository secret BLACKBOX = your password."
+            exit 1
+          fi
+
+          # One secret = storepass + keypass for a keystore generated on the fly
+          keytool -genkeypair \
+            -v \
+            -keystore blackbox_release.jks \
+            -alias blackbox \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "$BLACKBOX" \
+            -keypass "$BLACKBOX" \
+            -dname "CN=Blackbox, OU=Mobile, O=Blackbox, L=Unknown, ST=Unknown, C=RU"
+
+          echo "Keystore created successfully"
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p output_apks
+
+          "$BUILD_TOOLS/zipalign" -f -p 4 \
+            app/build/outputs/apk/release/app-release-unsigned.apk \
+            phone-aligned.apk
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks blackbox_release.jks \
+            --ks-key-alias blackbox \
+            --ks-pass env:BLACKBOX \
+            --key-pass env:BLACKBOX \
+            --out output_apks/BlackboxPhone.apk \
+            phone-aligned.apk
+
+          if [ -f wear/build/outputs/apk/release/wear-release-unsigned.apk ]; then
+            "$BUILD_TOOLS/zipalign" -f -p 4 \
+              wear/build/outputs/apk/release/wear-release-unsigned.apk \
+              watch-aligned.apk
+
+            "$BUILD_TOOLS/apksigner" sign \
+              --ks blackbox_release.jks \
+              --ks-key-alias blackbox \
+              --ks-pass env:BLACKBOX \
+              --key-pass env:BLACKBOX \
+              --out output_apks/BlackboxWatch.apk \
+              watch-aligned.apk
+          fi
+
+          "$BUILD_TOOLS/apksigner" verify --verbose output_apks/BlackboxPhone.apk
+
+          if [ -f output_apks/BlackboxWatch.apk ]; then
+            "$BUILD_TOOLS/apksigner" verify --verbose output_apks/BlackboxWatch.apk
+          fi
+
+          ls -lh output_apks/
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blackbox-Realtime-Phone-and-Watch-V12-GeminiNano
+          path: output_apks/*.apk
+          if-no-files-found: error
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -f blackbox_release.jks phone-aligned.apk watch-aligned.apk
