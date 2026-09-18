@@ -134,8 +134,7 @@ jobs:
           set -euo pipefail
           gradle :app:assembleRelease :wear:assembleRelease \
             --no-daemon --stacktrace
-
-      - name: Create keystore and sign APKs (1 secret: BLACKBOX)
+- name: "Create keystore and sign APKs (1 secret BLACKBOX)"
         shell: bash
         env:
           BLACKBOX: ${{ secrets.BLACKBOX }}
